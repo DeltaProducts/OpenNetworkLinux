@@ -23,7 +23,7 @@ Build ONL Summary
 ------------------------------------------------------------
 The easiest way to build is to use the make docker command:
 
-    #> git clone https://github.com/opencomputeproject/OpenNetworkLinux
+    #> git clone https://github.com/DeltaProducts/OpenNetworkLinux
     #> cd OpenNetworkLinux
     #> make docker
 
