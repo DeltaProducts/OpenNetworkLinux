@@ -31,9 +31,9 @@ else
         if /bin/boot-config.py configure; then
             echo "The system will now reboot to apply your configuration."
             reboot
-	else
-	    echo "The boot-config script failed." >> /etc/onl/abort
-	fi
+	    else
+	        echo "The boot-config script failed." >> /etc/onl/abort
+	    fi
     else
         echo "No boot-config." >> /etc/onl/abort
     fi
