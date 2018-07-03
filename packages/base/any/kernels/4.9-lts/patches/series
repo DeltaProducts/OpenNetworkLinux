@@ -13,3 +13,8 @@ driver-support-intel-igb-bcm5461-phy.patch
 0012-i2c-busses-Add-capabilities-to-i2c-mlxcpld.patch
 driver-i2c-i2c-core.patch
 driver-add-the-support-max6620.patch
+0017-i2c-Add-ME-PMBbus-Proxy-driver.patch
+0018-i2c-add-mei-insternal-access-interface.patch
+0019-expand-ipmi-max-message-size.patch
+0020-add-the-mux-bus-when-idle.patch
+0021-Add-reboot-event-to-ipmi.patch

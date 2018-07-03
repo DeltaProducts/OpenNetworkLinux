@@ -1,0 +1,48 @@
+From 66dd8076c72f88f7d73788ae3c8595ede6286a88 Mon Sep 17 00:00:00 2001
+From: "shaohua.xiong" <shaohua.xiong@deltaww.com>
+Date: Thu, 18 Jan 2018 17:04:49 +0800
+Subject: [PATCH] expand-ipmi-max-message-size
+
+---
+ drivers/char/ipmi/ipmi_msghandler.c | 6 ++++--
+ include/uapi/linux/ipmi_msgdefs.h   | 3 ++-
+ 2 files changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/char/ipmi/ipmi_msghandler.c b/drivers/char/ipmi/ipmi_msghandler.c
+index 5d509cc..7d6fe00 100644
+--- a/drivers/char/ipmi/ipmi_msghandler.c
++++ b/drivers/char/ipmi/ipmi_msghandler.c
+@@ -4287,12 +4287,14 @@ static void dummy_recv_done_handler(struct ipmi_recv_msg *msg)
+ /*
+  * Inside a panic, send a message and wait for a response.
+  */
++static struct ipmi_smi_msg  smi_msg;
++static struct ipmi_recv_msg recv_msg;
+ static void ipmi_panic_request_and_wait(ipmi_smi_t           intf,
+ 					struct ipmi_addr     *addr,
+ 					struct kernel_ipmi_msg *msg)
+ {
+-	struct ipmi_smi_msg  smi_msg;
+-	struct ipmi_recv_msg recv_msg;
++	//struct ipmi_smi_msg  smi_msg;
++	//struct ipmi_recv_msg recv_msg;
+ 	int rv;
+ 
+ 	smi_msg.done = dummy_smi_done_handler;
+diff --git a/include/uapi/linux/ipmi_msgdefs.h b/include/uapi/linux/ipmi_msgdefs.h
+index df97e6e..9bd3faa 100644
+--- a/include/uapi/linux/ipmi_msgdefs.h
++++ b/include/uapi/linux/ipmi_msgdefs.h
+@@ -79,7 +79,8 @@
+  * than 128 bytes.  Use the full 256, plus NetFn/LUN, Cmd, cCode, plus
+  * some overhead; it's not worth the effort to dynamically size this based
+  * on the results of the "Get BT Capabilities" command. */
+-#define IPMI_MAX_MSG_LENGTH	272	/* multiple of 16 */
++//#define IPMI_MAX_MSG_LENGTH	272	/* multiple of 16 */
++#define IPMI_MAX_MSG_LENGTH	((32 * 1024) + 16) /* multiple of 16 */
+ 
+ #define IPMI_CC_NO_ERROR		0x00
+ #define IPMI_NODE_BUSY_ERR		0xc0
+-- 
+2.7.4
+

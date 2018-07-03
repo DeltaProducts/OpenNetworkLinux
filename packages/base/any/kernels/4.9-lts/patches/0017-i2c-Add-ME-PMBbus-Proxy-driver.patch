@@ -1,0 +1,432 @@
+From a97fd0e59fc88076941405ccd287cd6ce3eedb9e Mon Sep 17 00:00:00 2001
+From: "shaohua.xiong" <shaohua.xiong@deltaww.com>
+Date: Tue, 16 Jan 2018 14:10:53 +0800
+Subject: [PATCH] linux-4.9.30-Add ME PMBbus Proxy i2c driver
+
+---
+ drivers/i2c/busses/Kconfig             |  10 +
+ drivers/i2c/busses/Makefile            |   2 +
+ drivers/i2c/busses/i2c-me-pmbusproxy.c | 379 +++++++++++++++++++++++++++++++++
+ 3 files changed, 391 insertions(+)
+ create mode 100644 drivers/i2c/busses/i2c-me-pmbusproxy.c
+
+diff --git a/drivers/i2c/busses/Kconfig b/drivers/i2c/busses/Kconfig
+index 6399cea..48e25f7 100644
+--- a/drivers/i2c/busses/Kconfig
++++ b/drivers/i2c/busses/Kconfig
+@@ -1225,4 +1225,14 @@ config I2C_OPAL
+ 	  This driver can also be built as a module. If so, the module will be
+ 	  called as i2c-opal.
+ 
++config I2C_ME_PMBUS_PROXY
++	tristate "Intel ME SPS PMBUS Proxy I2C driver"
++	depends on INTEL_MEI_ME
++	default n
++	help
++
++	  This driver can also be built as a module. If so, the module will be
++	  called i2c-me-pmbusproxy.
++
+ endmenu
++
+diff --git a/drivers/i2c/busses/Makefile b/drivers/i2c/busses/Makefile
+index 645bf08..fad037d 100644
+--- a/drivers/i2c/busses/Makefile
++++ b/drivers/i2c/busses/Makefile
+@@ -100,6 +100,8 @@ obj-$(CONFIG_I2C_XLR)		+= i2c-xlr.o
+ obj-$(CONFIG_I2C_XLP9XX)	+= i2c-xlp9xx.o
+ obj-$(CONFIG_I2C_RCAR)		+= i2c-rcar.o
+ 
++obj-$(CONFIG_I2C_ME_PMBUS_PROXY) += i2c-me-pmbusproxy.o
++
+ # External I2C/SMBus adapter drivers
+ obj-$(CONFIG_I2C_DIOLAN_U2C)	+= i2c-diolan-u2c.o
+ obj-$(CONFIG_I2C_DLN2)		+= i2c-dln2.o
+diff --git a/drivers/i2c/busses/i2c-me-pmbusproxy.c b/drivers/i2c/busses/i2c-me-pmbusproxy.c
+new file mode 100644
+index 0000000..2105a50
+--- /dev/null
++++ b/drivers/i2c/busses/i2c-me-pmbusproxy.c
+@@ -0,0 +1,379 @@
++/*
++    i2c-ime.c - Linux kernel driver for Intel ME_PMBUS_PROXY chipset SMBus
++    - Based on i2c-piix4.c
++    Copyright (c) 1998 - 2002 Frodo Looijaard <frodol@dds.nl> and
++    Philip Edelbrock <phil@netroedge.com>
++    - Intel ME_PMBUS_PROXY support
++    Copyright (c) 2007 - 2008 Jacob Jun Pan <jacob.jun.pan@intel.com>
++
++    This program is free software; you can redistribute it and/or modify
++    it under the terms of the GNU General Public License version 2 as
++    published by the Free Software Foundation.
++
++    This program is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++*/
++
++/*
++   Supports:
++	Intel ME_PMBUS_PROXY chipsets (AF82US15W, AF82US15L, AF82UL11L)
++   Note: we assume there can only be one device, with one SMBus interface.
++*/
++
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/kernel.h>
++#include <linux/delay.h>
++#include <linux/stddef.h>
++#include <linux/ioport.h>
++#include <linux/i2c.h>
++#include <linux/io.h>
++#include <linux/acpi.h>
++
++/* I2C constants */
++#define ME_PMBUS_PROXY_SEND_BYTE		0x00
++#define ME_PMBUS_PROXY_READ_BYTE		0x01
++#define ME_PMBUS_PROXY_WRITE_BYTE		0x02
++#define ME_PMBUS_PROXY_READ_WORD		0x03
++#define ME_PMBUS_PROXY_WRITE_WORD		0x04
++#define ME_PMBUS_PROXY_BLOCK_READ		0x05
++#define ME_PMBUS_PROXY_BLOCK_WRITE		0x06
++
++extern int mei_hbm_internel_access (void *mei_dev,
++				    int me_addr, int host_addr,
++				    u8 * req_data, int req_data_len,
++				    u8 * rep_data, int rep_data_len,
++				    int *real_rep_data_len);
++
++static inline int
++bus_id (struct i2c_adapter *adap)
++{
++  return (((struct platform_device *) (adap)->algo_data)->id);
++}
++
++static inline void *
++mei_dev (struct i2c_adapter *adap)
++{
++  struct _me_pmbus_proxy_data
++  {
++    void *mei_dev;
++  } *me_pmbus_proxy_data;
++
++  me_pmbus_proxy_data =
++    (struct _me_pmbus_proxy_data
++     *) (((struct platform_device *) (adap)->algo_data)->dev.platform_data);
++  return me_pmbus_proxy_data->mei_dev;
++}
++
++/*
++ * Start the i2c transaction -- the i2c_access will prepare the transaction
++ * and this function will execute it.
++ * return 0 for success and others for failure.
++ */
++static int
++me_transaction (struct i2c_adapter *adap, u8 * req, int len, u8 * res)
++{
++  int res_len = 0;
++  int ret = 0;
++
++#if 0
++  {
++    int i;
++    printk ("req : ");
++    for (i = 0; i < len; i++)
++      printk ("%02x ", req[i]);
++    printk ("\n");
++  }
++#endif
++  ret = mei_hbm_internel_access (mei_dev (adap), 0x20, 0,
++				 req, len, res, 32, &res_len);
++  if (ret)
++    return ret;
++#if 0
++  {
++    int i;
++    printk ("res : ");
++    for (i = 0; i < res_len; i++)
++      printk ("%02x ", res[i]);
++    printk ("\n");
++  }
++#endif
++
++  if (res_len < 2 || res[0] != 0x8a)
++    return -EIO;
++
++  ret = -EIO;
++  switch (res[1])
++    {
++    case 0x00:
++      ret = 0;
++      break;
++
++    case 0x80:
++      ret = -ENODEV;
++      break;
++
++    case 0x81:
++      ret = -EAGAIN;
++      break;
++
++    case 0x82:
++    case 0xa1:
++      ret = -EINVAL;
++      break;
++
++    case 0xa2:
++      ret = -EBADE;
++      break;
++
++    case 0xa5:
++    case 0xa7:
++      ret = -EINVAL;
++      break;
++
++    case 0xa9:
++      ret = -EIO;
++      break;
++    case 0xaa:
++      ret = -ETIMEDOUT;
++      break;
++    default:
++      printk ("Unknow respone result code 0x%02x\n", res[1]);
++      break;
++    }
++
++  return ret;
++}
++
++/*
++ * This is the main access entry for i2c-me access
++ * adap is i2c_adapter pointer, addr is the i2c device bus address, read_write
++ * (0 for read and 1 for write), size is i2c transaction type and data is the
++ * union of transaction for data to be transferred or data read from bus.
++ * return 0 for success and others for failure.
++ */
++static s32
++me_access (struct i2c_adapter *adap, u16 addr,
++	   unsigned short flags, char read_write,
++	   u8 command, int size, union i2c_smbus_data *data)
++{
++  int i, rc;
++  u8 cmd[32];
++  u8 res[32];
++  int data_len = 0;
++  int extended_mode = (bus_id (adap) >= 0);
++  int extended_offset = extended_mode ? 3 : 0;
++
++  dev_dbg (&adap->dev, "access size: %d %s\n", size,
++	   (read_write) ? "READ" : "WRITE");
++
++  memset (cmd, 0, sizeof (cmd));
++  memset (res, 0, sizeof (cmd));
++
++  cmd[0] = 0x0a;
++
++  switch (size)
++    {
++    case I2C_SMBUS_BYTE:
++      cmd[1] = ME_PMBUS_PROXY_READ_BYTE << 1;
++      if (read_write == I2C_SMBUS_WRITE)
++	{
++	  cmd[1] = ME_PMBUS_PROXY_SEND_BYTE << 1;
++	  cmd[extended_offset + 7] = command;
++	  cmd[extended_offset + 5] = 1;
++	}
++      else
++	{
++	  cmd[extended_offset + 5] = 1;
++	  cmd[extended_offset + 6] = 1;
++	}
++      break;
++    case I2C_SMBUS_BYTE_DATA:
++      cmd[1] = ME_PMBUS_PROXY_READ_BYTE << 1;
++      cmd[extended_offset + 7] = command;
++      if (read_write == I2C_SMBUS_WRITE)
++	{
++	  cmd[1] = ME_PMBUS_PROXY_WRITE_BYTE << 1;
++	  cmd[extended_offset + 8] = data->byte;
++	  cmd[extended_offset + 5] = 1 + 1;
++	}
++      else
++	{
++	  cmd[extended_offset + 5] = 1;
++	  cmd[extended_offset + 6] = 1;
++	}
++      break;
++    case I2C_SMBUS_WORD_DATA:
++      cmd[1] = ME_PMBUS_PROXY_READ_WORD << 1;
++      cmd[extended_offset + 7] = command;
++      if (read_write == I2C_SMBUS_WRITE)
++	{
++	  cmd[extended_offset + 1] = ME_PMBUS_PROXY_WRITE_WORD << 1;
++	  cmd[extended_offset + 8] = data->word & 0xff;
++	  cmd[extended_offset + 9] = (data->word & 0xff00) >> 8;
++
++	  cmd[extended_offset + 5] = 1 + 2;
++	}
++      else
++	{
++	  cmd[extended_offset + 5] = 1;
++	  cmd[extended_offset + 6] = 2;
++	}
++      break;
++    case I2C_SMBUS_BLOCK_DATA:
++      cmd[1] = ME_PMBUS_PROXY_BLOCK_READ << 1;
++      cmd[extended_offset + 7] = command;
++      if (read_write == I2C_SMBUS_WRITE)
++	{
++	  cmd[1] = ME_PMBUS_PROXY_BLOCK_WRITE << 1;
++	  data_len = data->block[0];
++	  if (data_len == 0 || data_len > (32 - 7 - 1))
++	    return -EINVAL;
++	  cmd[extended_offset + 8] = data_len;
++	  cmd[extended_offset + 5] = data_len + 1 + 1;
++
++	  for (i = 0; i < data_len; i++)
++	    cmd[extended_offset + 9 + i] = data->block[i];
++	}
++      else
++	{
++	  cmd[extended_offset + 5] = 1;
++	  cmd[extended_offset + 6] = data_len;
++	}
++      break;
++    default:
++      dev_warn (&adap->dev, "Unsupported transaction %d\n", size);
++      return -EOPNOTSUPP;
++    }
++  cmd[1] |= 0x40;		/* operation type */
++  cmd[1] |= bus_id (adap) < 0 ? 0x00 : 0x10;
++
++  if (!extended_mode)
++    {
++      cmd[2] = addr << 1;	/* i2c address */
++      cmd[3] = 0;		/* mux mgpio, not use */
++      cmd[4] = 0;		/* reserved */
++    }
++  else
++    {
++      cmd[2] = bus_id (adap);
++      cmd[3] = addr << 1;	/* i2c address */
++      cmd[4] = 0;
++      cmd[5] = 0;
++      cmd[6] = 0;
++      cmd[7] = 0;
++    }
++
++  rc = me_transaction (adap, cmd,
++		       (read_write == I2C_SMBUS_WRITE) ?
++		       (cmd[extended_offset + 5] + 7 + extended_offset) :
++		       (7 + extended_offset + cmd[extended_offset + 5]), res);
++  if (rc)			/* Error in transaction */
++    return rc;
++
++  if (read_write == I2C_SMBUS_WRITE)
++    return 0;
++
++  switch (size)
++    {
++    case I2C_SMBUS_BYTE:
++    case I2C_SMBUS_BYTE_DATA:
++      data->byte = res[2 + 0];
++      break;
++    case I2C_SMBUS_WORD_DATA:
++      data->word = res[2 + 0] + (res[2 + 1] << 8);
++      break;
++    case I2C_SMBUS_BLOCK_DATA:
++      data->block[0] = res[2 + 0];
++      if (data->block[0] == 0 || data->block[0] > I2C_SMBUS_BLOCK_MAX)
++	return -EPROTO;
++      for (i = 1; i <= data->block[0]; i++)
++	data->block[i] = res[2 + 1 + i - 1];
++      break;
++    }
++  return 0;
++}
++
++static u32
++me_func (struct i2c_adapter *adapter)
++{
++  return I2C_FUNC_SMBUS_BYTE |
++    I2C_FUNC_SMBUS_BYTE_DATA | I2C_FUNC_SMBUS_WORD_DATA |
++    I2C_FUNC_SMBUS_BLOCK_DATA;
++}
++
++static const struct i2c_algorithm smbus_algorithm = {
++  .smbus_xfer = me_access,
++  .functionality = me_func,
++};
++
++static struct i2c_adapter *adapter_list[128];
++static int adapter_list_counter = 0;
++
++static int
++smbus_me_probe (struct platform_device *pdev)
++{
++  int retval;
++  struct i2c_adapter *adapter;
++
++  adapter = devm_kzalloc (&pdev->dev, sizeof (*adapter), GFP_KERNEL);
++  if (!adapter)
++    return -ENOMEM;
++
++  dev_dbg (&pdev->dev, "SMB id = 0x%X\n", pdev->id);
++
++  /* set up the sysfs linkage to our parent device */
++  adapter->dev.parent = &pdev->dev;
++
++  snprintf (adapter->name, sizeof (adapter->name),
++	    "SMBus ME_PMBUS_PROXY adapter at %04x", pdev->id);
++
++  adapter->owner = THIS_MODULE;
++
++  adapter->algo_data = pdev;
++  adapter->algo = &smbus_algorithm;
++
++
++  retval = i2c_add_adapter (adapter);
++  if (retval)
++    {
++      dev_err (&pdev->dev, "Couldn't register adapter!\n");
++      return retval;
++    }
++
++  adapter_list[adapter_list_counter++] = adapter;
++
++  return retval;
++}
++
++static int
++smbus_me_remove (struct platform_device *pdev)
++{
++  int i;
++
++  if (adapter_list_counter)
++    {
++      for (i = 0; i < adapter_list_counter; i++)
++	i2c_del_adapter (adapter_list[i]);
++      adapter_list_counter = 0;
++    }
++
++  return 0;
++}
++
++static struct platform_driver smbus_me_driver = {
++  .driver = {
++	     .name = "me_pmbus_proxy",
++	     },
++  .probe = smbus_me_probe,
++  .remove = smbus_me_remove,
++};
++
++module_platform_driver (smbus_me_driver);
++
++MODULE_AUTHOR ("Dave Hu <dave.hu@deltaww.com>");
++MODULE_DESCRIPTION ("Intel ME_PMBUS_PROXY SMBus driver");
++MODULE_LICENSE ("GPL");
++MODULE_ALIAS ("platform:me_smbus");
+-- 
+2.7.4
+

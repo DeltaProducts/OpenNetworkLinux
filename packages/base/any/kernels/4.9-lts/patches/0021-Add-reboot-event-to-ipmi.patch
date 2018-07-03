@@ -1,0 +1,293 @@
+From 319fdfe952b032d6415096121cf0c4aa8cef1344 Mon Sep 17 00:00:00 2001
+From: "dave.hu" <dave.hu@deltaww.com.cn>
+Date: Wed, 14 Jun 2017 09:01:29 +0800
+Subject: [PATCH] Add reboot event to ipmi
+
+---
+ drivers/char/ipmi/Makefile           |   2 +-
+ drivers/char/ipmi/reboot_injection.c | 260 +++++++++++++++++++++++++++++++++++
+ 2 files changed, 261 insertions(+), 1 deletion(-)
+ create mode 100755 drivers/char/ipmi/reboot_injection.c
+
+diff --git a/drivers/char/ipmi/Makefile b/drivers/char/ipmi/Makefile
+index f3ffde1..20d3a19 100644
+--- a/drivers/char/ipmi/Makefile
++++ b/drivers/char/ipmi/Makefile
+@@ -2,7 +2,7 @@
+ # Makefile for the ipmi drivers.
+ #
+ 
+-ipmi_si-y := ipmi_si_intf.o ipmi_kcs_sm.o ipmi_smic_sm.o ipmi_bt_sm.o
++ipmi_si-y := ipmi_si_intf.o ipmi_kcs_sm.o ipmi_smic_sm.o ipmi_bt_sm.o reboot_injection.o
+ 
+ obj-$(CONFIG_IPMI_HANDLER) += ipmi_msghandler.o
+ obj-$(CONFIG_IPMI_DEVICE_INTERFACE) += ipmi_devintf.o
+diff --git a/drivers/char/ipmi/reboot_injection.c b/drivers/char/ipmi/reboot_injection.c
+new file mode 100755
+index 0000000..d45aa61
+--- /dev/null
++++ b/drivers/char/ipmi/reboot_injection.c
+@@ -0,0 +1,260 @@
++#include <linux/module.h>
++#include <linux/moduleparam.h>
++#include <linux/types.h>
++#include <linux/kernel.h>
++#include <linux/stddef.h>
++#include <linux/completion.h>
++#include <linux/i2c.h>
++#include <linux/errno.h>
++#include <linux/poll.h>
++#include <linux/sched.h>
++#include <linux/spinlock.h>
++#include <linux/slab.h>
++#include <linux/ipmi.h>
++#include <linux/mutex.h>
++#include <linux/init.h>
++#include <linux/device.h>
++#include <linux/compat.h>
++#include <linux/list.h>
++#include <linux/reboot.h>
++
++struct _ipmi_bmc_private
++{
++	ipmi_user_t          user;
++	spinlock_t           recv_msg_lock;
++	struct list_head     recv_msgs;
++
++	wait_queue_head_t    wait;
++	struct mutex	     recv_mutex;
++	int                  default_retries;
++	unsigned int         default_retry_time_ms;
++
++  
++	long	msgid;
++};
++
++static struct _ipmi_bmc_private __bmc_msg;
++static DEFINE_MUTEX(ipmi_mutex);
++
++static void _ipmi_receive_handler(struct ipmi_recv_msg *msg,
++				 void                 *handler_data)
++{
++	struct _ipmi_bmc_private *bmc_msg = handler_data;
++	int                      was_empty;
++	unsigned long            flags;
++
++	spin_lock_irqsave(&(bmc_msg->recv_msg_lock), flags);
++
++	was_empty = list_empty(&(bmc_msg->recv_msgs));
++	list_add_tail(&(msg->link), &(bmc_msg->recv_msgs));
++
++
++	if (was_empty) {
++		wake_up_interruptible(&bmc_msg->wait);
++	}
++
++	spin_unlock_irqrestore(&(bmc_msg->recv_msg_lock), flags);
++}
++
++
++static struct ipmi_user_hndl ipmi_hndlrs =
++{
++	.ipmi_recv_hndl	= _ipmi_receive_handler,
++};
++
++static int _ipmi_open(struct _ipmi_bmc_private *bmc_msg)
++{
++	//int                      if_num = iminor(inode);
++  int                      if_num = 0;
++	int                      rv = 0;
++
++	mutex_lock(&ipmi_mutex);
++
++	rv = ipmi_create_user(if_num,
++			      &ipmi_hndlrs,
++			      bmc_msg,
++			      &(bmc_msg->user));
++	if (rv) {
++		goto out;
++	}
++
++	spin_lock_init(&(bmc_msg->recv_msg_lock));
++	INIT_LIST_HEAD(&(bmc_msg->recv_msgs));
++	init_waitqueue_head(&bmc_msg->wait);
++	mutex_init(&bmc_msg->recv_mutex);
++
++	/* Use the low-level defaults. */
++	bmc_msg->default_retries = -1;
++	bmc_msg->default_retry_time_ms = 0;
++
++out:
++	mutex_unlock(&ipmi_mutex);
++	return rv;
++}
++
++
++static int handle_send_req(ipmi_user_t     user,
++			   struct ipmi_req *req,
++			   int             retries,
++			   unsigned int    retry_time_ms)
++{
++	int              rv;
++	struct ipmi_addr addr;
++	struct kernel_ipmi_msg msg;
++
++	if (req->addr_len > sizeof(struct ipmi_addr))
++		return -EINVAL;
++
++	memcpy (&addr, req->addr, req->addr_len);
++
++	msg.netfn = req->msg.netfn;
++	msg.cmd = req->msg.cmd;
++	msg.data_len = req->msg.data_len;
++	msg.data = kmalloc(IPMI_MAX_MSG_LENGTH, GFP_KERNEL);
++	if (!msg.data)
++		return -ENOMEM;
++
++	/* From here out we cannot return, we must jump to "out" for
++	   error exits to free msgdata. */
++
++	rv = ipmi_validate_addr(&addr, req->addr_len);
++	if (rv)
++		goto out;
++
++	if (req->msg.data != NULL) {
++		if (req->msg.data_len > IPMI_MAX_MSG_LENGTH) {
++			rv = -EMSGSIZE;
++			goto out;
++		}
++
++		memcpy (msg.data, req->msg.data, req->msg.data_len);
++	} else {
++		msg.data_len = 0;
++	}
++
++	rv = ipmi_request_settime(user,
++				  &addr,
++				  req->msgid,
++				  &msg,
++				  NULL,
++				  0,
++				  retries,
++				  retry_time_ms);
++ out:
++	kfree(msg.data);
++	return rv;
++}
++
++typedef struct
++{
++    uint16_t ID;
++    uint8_t  Type;
++    uint32_t TimeStamp;
++
++} __attribute__ ((packed)) SELRecHdr_T;
++
++typedef struct
++{
++    /* SEL ENTRY RECORD HEADER */
++    SELRecHdr_T hdr;
++
++    /* RECORD BODY BYTES */
++    uint8_t   GenID [2];
++    uint8_t   EvMRev;
++    uint8_t   SensorType;
++    uint8_t   SensorNum;
++    uint8_t   EvtDirType;
++    uint8_t   EvtData1;
++    uint8_t   EvtData2;
++    uint8_t   EvtData3;
++
++} __attribute__ ((packed)) SELEventRecord_T;
++
++static int log_to_sel (SELEventRecord_T *buf, int size)
++{
++	struct ipmi_req req;
++	int rv;
++	struct ipmi_system_interface_addr bmc_addr = {
++		.addr_type = IPMI_SYSTEM_INTERFACE_ADDR_TYPE,
++		.channel = IPMI_BMC_CHANNEL,
++	};
++
++	bmc_addr.lun = 0;
++
++	req.addr = (unsigned char *)&bmc_addr;
++	req.addr_len = sizeof(bmc_addr);
++
++	req.msgid = __bmc_msg.msgid ;
++
++	req.msg.netfn = 0x0a;
++	req.msg.cmd   = 0x44;
++	req.msg.data_len = size;
++	req.msg.data     = (char *)buf;
++
++	rv = handle_send_req(__bmc_msg.user,
++				&req,
++				__bmc_msg.default_retries,
++				__bmc_msg.default_retry_time_ms);
++
++	return rv;
++}
++
++static int log_warm_restart (void)
++{
++	SELEventRecord_T esel;
++
++	esel.hdr.ID = 0x00;
++	esel.hdr.Type = 0x02;
++	esel.hdr.TimeStamp = 0x00;
++
++	esel.GenID[0] = 0x20;
++	esel.GenID[0] = 0x00;
++	esel.EvMRev   = 0x04;
++	esel.SensorType = 0x1d;
++	esel.SensorNum  = 0x00;
++	esel.EvtDirType = 0x6f;
++	esel.EvtData1   = 0x06;
++	esel.EvtData2   = 0xff;
++	esel.EvtData3   = 0xff;
++
++	return log_to_sel (&esel, sizeof(esel));
++}
++
++static int
++port_led_off(struct notifier_block *notifier, unsigned long val, void *v)
++{
++	log_warm_restart ();
++
++	return NOTIFY_OK;
++}
++
++
++static struct notifier_block port_led_off_notifier = {
++	.notifier_call = port_led_off,
++	.priority = INT_MAX,
++};
++
++
++static int __init reboot_injection_init (void)
++{
++	_ipmi_open (&__bmc_msg);
++
++	register_reboot_notifier(&port_led_off_notifier);
++	return 0;
++}
++
++static void __exit reboot_injection_exit (void)
++{
++	unregister_reboot_notifier(&port_led_off_notifier);
++}
++
++
++
++MODULE_AUTHOR("Dave Hu <dave.hu@deltaww.com>");
++MODULE_DESCRIPTION("KERNEL reboot injection");
++MODULE_LICENSE("GPL");
++
++module_init(reboot_injection_init);
++module_exit(reboot_injection_exit);
++
++
+-- 
+1.9.1
+

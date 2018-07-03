@@ -1,0 +1,356 @@
+From de34d2022773462f4879a50af38d52581bcad1ab Mon Sep 17 00:00:00 2001
+From: "shaohua.xiong" <shaohua.xiong@deltaww.com>
+Date: Tue, 16 Jan 2018 14:49:15 +0800
+Subject: [PATCH] linux-4.9.30-add mei insternal access interface
+
+---
+ drivers/misc/mei/Makefile       |   1 +
+ drivers/misc/mei/hbm-internal.c | 127 ++++++++++++++++++++++++++++++++++++++++
+ drivers/misc/mei/hbm.h          |   5 ++
+ drivers/misc/mei/init.c         |   2 +
+ drivers/misc/mei/interrupt.c    |  23 +++++++-
+ drivers/misc/mei/mei_dev.h      |  28 ++++++++-
+ drivers/misc/mei/pci-me.c       |  42 ++++++++++++-
+ 7 files changed, 222 insertions(+), 6 deletions(-)
+ create mode 100644 drivers/misc/mei/hbm-internal.c
+
+diff --git a/drivers/misc/mei/Makefile b/drivers/misc/mei/Makefile
+index 59e6b0a..2756ba4 100644
+--- a/drivers/misc/mei/Makefile
++++ b/drivers/misc/mei/Makefile
+@@ -5,6 +5,7 @@
+ obj-$(CONFIG_INTEL_MEI) += mei.o
+ mei-objs := init.o
+ mei-objs += hbm.o
++mei-objs += hbm-internal.o
+ mei-objs += interrupt.o
+ mei-objs += client.o
+ mei-objs += main.o
+diff --git a/drivers/misc/mei/hbm-internal.c b/drivers/misc/mei/hbm-internal.c
+new file mode 100644
+index 0000000..b5db426
+--- /dev/null
++++ b/drivers/misc/mei/hbm-internal.c
+@@ -0,0 +1,127 @@
++/*
++ *
++ * Intel Management Engine Interface (Intel MEI) Linux driver
++ * Copyright (c) 2003-2012, Intel Corporation.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ *
++ */
++
++#include <linux/export.h>
++#include <linux/sched.h>
++#include <linux/wait.h>
++#include <linux/pm_runtime.h>
++#include <linux/slab.h>
++
++#include <linux/mei.h>
++
++#include "mei_dev.h"
++#include "hbm.h"
++#include "client.h"
++
++
++/**
++ * mei_hbm_internal_wait - wait for start response message.
++ *
++ * @dev: the device structure
++ *
++ * Return: 0 on success and < 0 on failure
++ */
++static int
++mei_hbm_internal_wait (struct mei_device *dev)
++{
++  int ret;
++
++  mutex_unlock (&dev->device_lock);
++  ret = wait_event_timeout (dev->internal_access.wait_hbm_rep,
++			    dev->internal_access.state ==
++			    HBM_ME_STATE_REP_READY,
++			    mei_secs_to_jiffies (1));
++  mutex_lock (&dev->device_lock);
++
++  if (ret == 0 && (dev->internal_access.state < HBM_ME_STATE_REP_READY))
++  {
++	dev->internal_access.state = HBM_ME_STATE_IDLE;
++    dev_err (dev->dev, "waiting for mei respone failed\n");
++	if (dev->dev_state != MEI_DEV_RESETTING) {
++		dev_err (dev->dev, "timeout , schedule mei reset\n");
++		schedule_work(&dev->reset_work);
++	}
++    return -ETIME;
++  }
++  return 0;
++}
++
++/**
++ * mei_hbm_internel_access - sends start request message.
++ *
++ * @dev: the device structure
++ *
++ * Return: 0 on success and < 0 on failure
++ */
++int
++mei_hbm_internel_access (struct mei_device *dev,
++			 int me_addr, int host_addr,
++			 u8 * req_data, int req_data_len,
++			 u8 * rep_data, int rep_data_len,
++			 int *real_rep_data_len)
++{
++  struct mei_msg_hdr *mei_hdr = &dev->internal_access.wr_msg.hdr;
++  int ret = 0;
++
++  if (real_rep_data_len)
++    *real_rep_data_len = 0;
++
++  mutex_lock (&dev->internal_access.mei_lock);
++
++  mutex_lock (&dev->device_lock);
++
++  mei_hdr->host_addr = host_addr;
++  mei_hdr->me_addr = me_addr;
++  mei_hdr->length = req_data_len;
++  mei_hdr->msg_complete = 1;
++  mei_hdr->reserved = 0;
++
++  /* host start message */
++  memcpy (dev->internal_access.wr_msg.data, req_data, req_data_len);
++
++  dev->internal_access.state = HBM_ME_STATE_BUSY;
++  ret = mei_write_message (dev, mei_hdr, dev->internal_access.wr_msg.data);
++  if (ret)
++    {
++      dev_err (dev->dev, "Internal Access message write failed: ret = %d\n",
++	       ret);
++      goto end;
++    }
++
++  ret = mei_hbm_internal_wait (dev);
++  if (ret)
++    {
++      goto end;
++    }
++
++  /* get respone */
++  memcpy (rep_data,
++	  dev->internal_access.rd_msg.data,
++	  dev->internal_access.rd_msg.data_len);
++
++  if (real_rep_data_len)
++    *real_rep_data_len = dev->internal_access.rd_msg.data_len;
++
++  dev->internal_access.state = HBM_ME_STATE_IDLE;
++
++end:
++  mutex_unlock (&dev->device_lock);
++
++  mutex_unlock (&dev->internal_access.mei_lock);
++  return ret;
++}
++
++EXPORT_SYMBOL_GPL (mei_hbm_internel_access);
+diff --git a/drivers/misc/mei/hbm.h b/drivers/misc/mei/hbm.h
+index a2025a5..e334f2f 100644
+--- a/drivers/misc/mei/hbm.h
++++ b/drivers/misc/mei/hbm.h
+@@ -57,6 +57,11 @@ int mei_hbm_pg(struct mei_device *dev, u8 pg_cmd);
+ void mei_hbm_pg_resume(struct mei_device *dev);
+ int mei_hbm_cl_notify_req(struct mei_device *dev,
+ 			  struct mei_cl *cl, u8 request);
++int mei_hbm_internel_access(struct mei_device *dev,
++        int me_addr, int host_addr,
++        u8 *req_data, int req_data_len,
++        u8 *rep_data, int rep_data_len,
++        int *real_rep_data_len);
+ 
+ #endif /* _MEI_HBM_H_ */
+ 
+diff --git a/drivers/misc/mei/init.c b/drivers/misc/mei/init.c
+index 9a9c248..8ebba7b 100644
+--- a/drivers/misc/mei/init.c
++++ b/drivers/misc/mei/init.c
+@@ -383,6 +383,8 @@ void mei_device_init(struct mei_device *dev,
+ 	init_waitqueue_head(&dev->wait_hw_ready);
+ 	init_waitqueue_head(&dev->wait_pg);
+ 	init_waitqueue_head(&dev->wait_hbm_start);
++	init_waitqueue_head(&dev->internal_access.wait_hbm_rep);
++	mutex_init(&dev->internal_access.mei_lock);
+ 	dev->dev_state = MEI_DEV_INITIALIZING;
+ 	dev->reset_count = 0;
+ 
+diff --git a/drivers/misc/mei/interrupt.c b/drivers/misc/mei/interrupt.c
+index 5a4893c..0c12027 100644
+--- a/drivers/misc/mei/interrupt.c
++++ b/drivers/misc/mei/interrupt.c
+@@ -274,8 +274,8 @@ int mei_irq_read_handler(struct mei_device *dev,
+ 	}
+ 
+ 	if (mei_slots2data(*slots) < mei_hdr->length) {
+-		dev_err(dev->dev, "less data available than length=%08x.\n",
+-				*slots);
++		dev_err(dev->dev, "less data available than length=0x%08x, slots=0x%08x\n",
++			mei_hdr->length, *slots);
+ 		/* we can't read the message */
+ 		ret = -ENODATA;
+ 		goto end;
+@@ -291,7 +291,26 @@ int mei_irq_read_handler(struct mei_device *dev,
+ 		}
+ 		goto reset_slots;
+ 	}
++	/* Internal access */
++	if (mei_hdr->host_addr == dev->internal_access.wr_msg.hdr.host_addr &&
++	    mei_hdr->me_addr   == dev->internal_access.wr_msg.hdr.me_addr) {
++
++			mei_read_slots(dev,
++				dev->internal_access.rd_msg.data, mei_hdr->length);
++
++			dev->internal_access.rd_msg.data_len = mei_hdr->length;
++			dev->internal_access.rd_msg.hdr = *mei_hdr;
++			if (dev->internal_access.state > HBM_ME_STATE_IDLE) {
++				dev->internal_access.state = HBM_ME_STATE_REP_READY;
++				wake_up(&dev->internal_access.wait_hbm_rep);
++				ret = 0;
++				goto reset_slots;
++			}
++
++            ret = 0;
+ 
++			goto reset_slots;
++	}
+ 	/* find recipient cl */
+ 	list_for_each_entry(cl, &dev->file_list, link) {
+ 		if (mei_cl_hbm_equal(cl, mei_hdr)) {
+diff --git a/drivers/misc/mei/mei_dev.h b/drivers/misc/mei/mei_dev.h
+index 1169fd9..3df89f8 100644
+--- a/drivers/misc/mei/mei_dev.h
++++ b/drivers/misc/mei/mei_dev.h
+@@ -342,6 +342,32 @@ enum mei_pg_state {
+ 
+ const char *mei_pg_state_str(enum mei_pg_state state);
+ 
++enum hbm_me_state
++{
++	HBM_ME_STATE_IDLE = 0,
++	HBM_ME_STATE_BUSY = 1,
++	HBM_ME_STATE_REP_READY = 2
++};
++
++struct hbm_me
++{
++	/* used for control messages */
++	struct {
++		struct mei_msg_hdr hdr;
++		unsigned char data[128];
++	} wr_msg;
++	struct {
++		struct mei_msg_hdr hdr;
++		unsigned char data[128];
++		int data_len;
++	} rd_msg;
++
++	wait_queue_head_t wait_hbm_rep;
++	enum hbm_me_state state;
++
++    struct mutex mei_lock;
++};
++
+ /**
+  * struct mei_device -  MEI private device struct
+  *
+@@ -496,7 +522,7 @@ struct mei_device {
+ 	struct dentry *dbgfs_dir;
+ #endif /* CONFIG_DEBUG_FS */
+ 
+-
++	struct hbm_me internal_access;
+ 	const struct mei_hw_ops *ops;
+ 	char hw[0] __aligned(sizeof(void *));
+ };
+diff --git a/drivers/misc/mei/pci-me.c b/drivers/misc/mei/pci-me.c
+index f9c6ec4..aa11cc4 100644
+--- a/drivers/misc/mei/pci-me.c
++++ b/drivers/misc/mei/pci-me.c
+@@ -35,7 +35,8 @@
+ #include <linux/pm_runtime.h>
+ 
+ #include <linux/mei.h>
+-
++#include <linux/delay.h>
++#include <linux/platform_device.h>
+ #include "mei_dev.h"
+ #include "client.h"
+ #include "hw-me-regs.h"
+@@ -120,7 +121,7 @@ static inline void mei_me_unset_pm_domain(struct mei_device *dev) {}
+ static bool mei_me_quirk_probe(struct pci_dev *pdev,
+ 				const struct mei_cfg *cfg)
+ {
+-	if (cfg->quirk_probe && cfg->quirk_probe(pdev)) {
++	if (cfg->quirk_probe && !cfg->quirk_probe(pdev)) {
+ 		dev_info(&pdev->dev, "Device doesn't have valid ME Interface\n");
+ 		return false;
+ 	}
+@@ -143,7 +144,12 @@ static int mei_me_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 	struct mei_me_hw *hw;
+ 	unsigned int irqflags;
+ 	int err;
+-
++	u16 *sps_features = NULL;
++	u8   sps_feature_cmd = 0x01;
++	u8   sps_feature_rep[32];
++	struct _me_pmbus_proxy_data {
++		void *mei_dev;
++	} me_pmbus_proxy_data ;
+ 
+ 	if (!mei_me_quirk_probe(pdev, cfg))
+ 		return -ENODEV;
+@@ -233,7 +239,37 @@ static int mei_me_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 		pm_runtime_put_noidle(&pdev->dev);
+ 
+ 	dev_dbg(&pdev->dev, "initialization successful.\n");
++	/* Get SPS feature */
++	sps_features = (u16 *)&sps_feature_rep[3];
++	memset (sps_feature_rep, 0, sizeof(sps_feature_rep));
++	mei_hbm_internel_access (dev, 0x20, 0,
++		&sps_feature_cmd, 1,
++		sps_feature_rep, sizeof(sps_feature_rep),
++		NULL);
++	if (sps_feature_rep[0] != 0x81) {
++		*sps_features = 0;
++	}
+ 
++	/* check if support Pmbus Proxy features */
++	if (*sps_features & (1 << 8)) {
++        
++		me_pmbus_proxy_data.mei_dev = dev;
++#if 0
++		/* skip smbus, use other driver i801 for it */
++		platform_device_register_data(&pdev->dev, "me_pmbus_proxy", 0, 
++			&me_pmbus_proxy_data, sizeof(me_pmbus_proxy_data));
++#endif
++		platform_device_register_data(&pdev->dev, "me_pmbus_proxy", 1,
++			&me_pmbus_proxy_data, sizeof(me_pmbus_proxy_data));
++		platform_device_register_data(&pdev->dev, "me_pmbus_proxy", 2, 
++			&me_pmbus_proxy_data, sizeof(me_pmbus_proxy_data));
++		platform_device_register_data(&pdev->dev, "me_pmbus_proxy", 3,
++			&me_pmbus_proxy_data, sizeof(me_pmbus_proxy_data));
++		platform_device_register_data(&pdev->dev, "me_pmbus_proxy", 4,
++			&me_pmbus_proxy_data, sizeof(me_pmbus_proxy_data));
++		platform_device_register_data(&pdev->dev, "me_pmbus_proxy", 5,
++			&me_pmbus_proxy_data, sizeof(me_pmbus_proxy_data));
++	}
+ 	return 0;
+ 
+ stop:
+-- 
+2.7.4
+
