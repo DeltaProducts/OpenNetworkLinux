@@ -30,7 +30,7 @@
 #include "platform_lib.h"
 #include "x86_64_delta_ag7648c_int.h"
 #include "x86_64_delta_i2c.h"
-
+#include "eeprom_info.h"
 #define CPLD_PSU_NAME                   "MASTERCPLD"
 
 #define PSU_STATUS_PRESENT    			1
@@ -148,31 +148,26 @@ psu_value_info_get(int id, char *type)
 
 
 static int
-psu_serial_model_info_get(int id,char *type,char*data,int data_len)
+psu_serial_model_info_get(int id,char *type,char*data)
 {
     int i,r_data,re_cnt;
+	uint8_t eeprom[256]={0};
     char *dev_name;
-    int reg_offset;
 
     if(PSU1_ID == id)
         dev_name="PSU1_EEPROM";
     else
         dev_name="PSU2_EEPROM";
 
-    if(!strcmp(type,"serial"))
-        reg_offset=PSU_PNBUS_SERIAL_REG;
-    else
-        reg_offset=PSU_PNBUS_MODEL_REG;
-
-    for(i=0;i<data_len;i++){
+    for(i=0;i<sizeof(eeprom);i++){
         re_cnt=3;
         while(re_cnt){
-            r_data=i2c_devname_read_byte(dev_name,reg_offset+i);
+            r_data=i2c_devname_read_byte(dev_name,i);
             if(r_data<0){
                 re_cnt--;
                 continue;
             }
-            data[i]=r_data;
+            eeprom[i]=(uint8_t)r_data;
             break;
         }
         if(re_cnt==0){
@@ -181,8 +176,7 @@ psu_serial_model_info_get(int id,char *type,char*data,int data_len)
         }
 
     }
-
-    return ONLP_STATUS_OK;
+	return eeprom_info_get(eeprom, sizeof(eeprom), type, data);
 }
 
 int
@@ -213,8 +207,6 @@ onlp_psui_info_get(onlp_oid_t id, onlp_psu_info_t* info)
     int index = ONLP_OID_ID_GET(id);
     psu_type_t psu_type;
     int r_data;
-    char sn_data[15]={0};
-    char model_data[17]={0};
 
     VALIDATE(id);
 
@@ -330,23 +322,18 @@ onlp_psui_info_get(onlp_oid_t id, onlp_psu_info_t* info)
     /* Get PSU serial
      */
 
-    ret=psu_serial_model_info_get(index,"serial",sn_data,14);
-    if (ret!=ONLP_STATUS_OK) {
-        AIM_LOG_INFO("Unable to read PSU %d SN value)\r\n", index);
-        return ONLP_STATUS_E_INVALID;
+    ret=psu_serial_model_info_get(index,"psu_series",info->serial);
+    if (ret <0) {
+		strcpy(info->serial,"Unknown");
     }
-
-    strcpy(info->serial,sn_data);
 
     /* Get PSU model
      */
-    ret=psu_serial_model_info_get(index,"model",model_data,16);
-    if (ret!=ONLP_STATUS_OK) {
-        AIM_LOG_INFO("Unable to read PSU %d model value)\r\n", index);
-        return ONLP_STATUS_E_INVALID;
+    ret=psu_serial_model_info_get(index,"psu_model",info->model);
+    if (ret <0) {
+		strcpy(info->model,"Unknown");
     }
 
-    strcpy(info->model,model_data);
     return ONLP_STATUS_OK;
 }
 
